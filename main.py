@@ -251,6 +251,20 @@ def fetch_inbox_threads(cl, box=None, pending=False):
     return (result.get("inbox") or {}).get("threads") or []
 
 
+def fetch_inbox_threads_retry(cl, box=None, pending=False, attempts=3):
+    """Vaqtinchalik tarmoq xatolarida (ConnectionError, timeout) bir necha marta qayta urinadi."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_inbox_threads(cl, box=box, pending=pending)
+        except (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
+                ChallengeRequired, ClientThrottledError, FeedbackRequired):
+            raise
+        except Exception:
+            if attempt == attempts:
+                raise
+            time.sleep(3 * attempt)
+
+
 def extract_item_text(item):
     item_type = item.get("item_type")
     if item_type == "text":
@@ -358,7 +372,7 @@ def run_bot_for_account(acc):
                 sources = [("primary", False), ("general", False), (None, True)]
                 for box, pending in sources:
                     try:
-                        for t in fetch_inbox_threads(cl, box=box, pending=pending):
+                        for t in fetch_inbox_threads_retry(cl, box=box, pending=pending):
                             tid = str(t.get("thread_id", ""))
                             if tid and tid not in seen_thread_ids:
                                 seen_thread_ids.add(tid)
@@ -515,6 +529,9 @@ def run_bot_for_account(acc):
 
 
 if __name__ == "__main__":
+    if not os.path.exists(ACCOUNTS_FILE):
+        print(f"❌ {ACCOUNTS_FILE} topilmadi. accounts.example.json dan nusxa oling yoki app.py orqali akkaunt qo'shing.")
+        raise SystemExit(1)
     with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
         accounts = json.load(f)
 
