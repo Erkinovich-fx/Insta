@@ -1,0 +1,9 @@
+.env
+*.session
+session_*.json
+accounts.json
+replied_data.json
+__pycache__/
+*.pyc
+venv/
+.idea/
