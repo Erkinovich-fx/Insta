@@ -22,18 +22,26 @@ ACCOUNTS_FILE = "accounts.json"
 DB_FILE = "replied_data.json"
 
 # Katta akkauntlar uchun sozlamalar
-LOOP_DELAY = (25, 40)            # Har bir aylanish orasidagi pauza (sekund)
+# Tezlik: DM lar tez-tez, izohlar va so'rovlar kamroq tekshiriladi.
+# DM_POLL_DELAY ni juda kichik qilmang — Instagram ko'p so'rovda cheklov (PleaseWait) qo'yadi.
+DM_POLL_DELAY = (8, 14)          # Asosiy/Umumiy DM lar har necha sekundda tekshiriladi
+PENDING_INTERVAL = 45            # So'rovlar (Requests) jildi har necha sekundda
+COMMENTS_INTERVAL = 90           # Izohlar har necha sekundda tekshiriladi
+REQUEST_DELAY = [0.3, 1.0]       # Har bir Instagram so'rovidan oldingi pauza (instagrapi)
 DM_THREADS_PER_BOX = 20          # Har bir jilddan nechta chat olinadi
 MEDIA_TO_WATCH = 6               # Eng yangi nechta post/reels kuzatiladi
 MEDIA_REFRESH_SEC = 600          # Postlar ro'yxati har 10 daqiqada yangilanadi
 MAX_REPLIES_PER_CYCLE = 8        # Bir aylanishda maksimum javoblar (spam-blokdan himoya)
-ACTION_DELAY = (4, 9)            # Har bir javobdan keyingi pauza
+ACTION_DELAY = (2, 5)            # Har bir javobdan keyingi pauza
 DB_MAX_IDS = 20000               # Bazada saqlanadigan maksimum ID lar
 
 DEFAULT_BEHAVIOR = (
     "Sen juda xushmuomala yordamchisan. Mijoz qaysi tilda yozsa, o'sha tilda javob qaytar "
     "(asosan O'zbek tilida). Qisqa, lo'nda va kamida 2 ta emoji ishlat."
 )
+
+
+FAST_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 
 def get_groq_models():
@@ -47,8 +55,10 @@ def get_groq_models():
                 m for m in all_models
                 if not any(x in m.lower() for x in ["whisper", "guard", "vision", "tts", "audio", "embed"])
             ]
-            preferred = []
-            for keyword in ["llama", "qwen", "deepseek", "gemma", "mixtral"]:
+            # Tez, "o'ylamaydigan" modellar birinchi. qwen/deepseek kabi reasoning modellar
+            # avval <think> yozadi — sekin va max_tokens da javob kesilib qolishi mumkin.
+            preferred = [m for m in FAST_MODELS if m in chat_models]
+            for keyword in ["llama", "gemma", "mixtral", "qwen", "deepseek"]:
                 for m in chat_models:
                     if keyword in m.lower() and m not in preferred:
                         preferred.append(m)
@@ -62,6 +72,7 @@ def get_groq_models():
     return ["llama-3.3-70b-versatile"]
 
 
+groq_session = requests.Session()  # ulanishni qayta ishlatadi (har safar yangi TLS emas)
 GROQ_MODELS = get_groq_models()
 models_lock = threading.Lock()
 
@@ -146,11 +157,13 @@ def call_groq(system_prompt, user_prompt):
             "max_tokens": 250,
         }
         try:
-            res = requests.post(url, headers=headers, json=data, timeout=20)
+            res = groq_session.post(url, headers=headers, json=data, timeout=15)
             if res.status_code == 200:
-                reply = res.json()["choices"][0]["message"]["content"].strip()
+                reply = (res.json()["choices"][0]["message"].get("content") or "").strip()
                 if "</think>" in reply:
                     reply = reply.split("</think>")[-1].strip()
+                elif "<think>" in reply:
+                    continue  # fikrlash tugamay kesilgan — keyingi modelga
                 reply = reply.replace("**", "").strip().strip('"').strip()
                 if reply:
                     return reply
@@ -196,7 +209,7 @@ def get_comment_and_dm_reply(business_info, behavior, user_text):
 def login_account(username, session_id):
     """Dashboard'da "password" maydoniga Session ID (cookie) yoziladi."""
     cl = Client()
-    cl.delay_range = [1, 3]
+    cl.delay_range = REQUEST_DELAY
     session_file = f"session_{username}.json"
 
     if os.path.exists(session_file):
@@ -210,7 +223,7 @@ def login_account(username, session_id):
         except Exception as e:
             print(f"[{username}] ⚠️ Saqlangan sessiya ishlamadi ({e}), Session ID bilan qayta ulanilmoqda...")
             cl = Client()
-            cl.delay_range = [1, 3]
+            cl.delay_range = REQUEST_DELAY
 
     try:
         cl.login_by_sessionid(session_id.strip())
@@ -350,6 +363,8 @@ def run_bot_for_account(acc):
     bot_start_ts = time.time()
 
     medias_cache = []
+    next_pending_ts = 0
+    next_comments_ts = 0
     medias_cache_ts = 0
     error_streak = 0
 
@@ -369,7 +384,10 @@ def run_bot_for_account(acc):
             if auto_dm:
                 threads = []  # (thread, pending)
                 seen_thread_ids = set()
-                sources = [("primary", False), ("general", False), (None, True)]
+                sources = [("primary", False), ("general", False)]
+                if time.time() >= next_pending_ts:
+                    sources.append((None, True))
+                    next_pending_ts = time.time() + PENDING_INTERVAL
                 for box, pending in sources:
                     try:
                         for t in fetch_inbox_threads_retry(cl, box=box, pending=pending):
@@ -429,7 +447,9 @@ def run_bot_for_account(acc):
                         time.sleep(random.uniform(*ACTION_DELAY))
 
             # --- B. REELS VA POST IZOHLARI ---
-            if auto_comment and replies_this_cycle < MAX_REPLIES_PER_CYCLE:
+            if (auto_comment and replies_this_cycle < MAX_REPLIES_PER_CYCLE
+                    and time.time() >= next_comments_ts):
+                next_comments_ts = time.time() + COMMENTS_INTERVAL
                 if not medias_cache or time.time() - medias_cache_ts > MEDIA_REFRESH_SEC:
                     try:
                         medias_cache = fetch_recent_medias(cl, my_user_id)
@@ -525,7 +545,7 @@ def run_bot_for_account(acc):
             time.sleep(30)
 
         # Bloklanmaslik uchun tasodifiy pauza
-        time.sleep(random.randint(*LOOP_DELAY))
+        time.sleep(random.uniform(*DM_POLL_DELAY))
 
 
 if __name__ == "__main__":
