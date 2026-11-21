@@ -1,0 +1,5 @@
+instagrapi==3.2.19
+requests>=2.31
+flask>=3.0
+# Faqat eski bot.py uchun (hozirgi main.py Groq ishlatadi, kerak emas):
+# google-genai
