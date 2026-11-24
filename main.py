@@ -48,7 +48,7 @@ def load_dotenv(path):
     """.env faylidan KALIT=QIYMAT qatorlarini o'qiydi (Termux'da har safar export qilish shart emas)."""
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:  # -sig: fayl boshidagi BOM belgisini olib tashlaydi
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -70,7 +70,24 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # 1. GROQ AI SOZLAMASI
 # Kalitni main.py yonidagi .env fayliga yozing:  GROQ_API_KEY=gsk_...
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip().strip('"').strip("'")
+def clean_key(raw):
+    """Nusxalashda qo'shilib qolgan bo'shliq, qo'shtirnoq, ko'rinmas belgilar, "Bearer " va h.k.
+    ni olib tashlaydi — faqat gsk_... qismini qoldiradi."""
+    raw = raw or ""
+    m = re.search(r"gsk_[A-Za-z0-9]+", raw)
+    if m:
+        return m.group()
+    return re.sub(r"[^A-Za-z0-9_\-]", "", raw)
+
+
+# Kalitni to'g'ridan-to'g'ri shu yerga ham yozishingiz mumkin (qo'shtirnoq ichiga).
+# Bu yerdagi kalit .env va export dan USTUN turadi.
+# ⚠️ Kalit yozilgan main.py ni GitHub'ga push qilmang — Groq kalitni avtomatik o'chirib yuboradi.
+GROQ_API_KEY_IN_CODE = ""
+
+if clean_key(GROQ_API_KEY_IN_CODE):
+    KEY_SOURCE["value"] = "main.py (GROQ_API_KEY_IN_CODE)"
+GROQ_API_KEY = clean_key(GROQ_API_KEY_IN_CODE) or clean_key(os.getenv("GROQ_API_KEY"))
 
 
 def describe_key(key):
