@@ -41,6 +41,9 @@ def fmt_time(ts):
         return "?"
 
 
+KEY_SOURCE = {"value": "muhit o'zgaruvchisi (export)"}
+
+
 def load_dotenv(path):
     """.env faylidan KALIT=QIYMAT qatorlarini o'qiydi (Termux'da har safar export qilish shart emas)."""
     if not os.path.exists(path):
@@ -55,7 +58,11 @@ def load_dotenv(path):
             if key.startswith("export "):
                 key = key[len("export "):].strip()
             value = value.strip().strip('"').strip("'")
-            if key and not os.environ.get(key):
+            if key:
+                # .env ustun turadi: Termux'da eski "export GROQ_API_KEY=..." qolib ketgan bo'lsa ham
+                # aynan .env dagi kalit ishlatiladi
+                if key == "GROQ_API_KEY":
+                    KEY_SOURCE["value"] = ".env"
                 os.environ[key] = value
 
 
@@ -63,7 +70,21 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # 1. GROQ AI SOZLAMASI
 # Kalitni main.py yonidagi .env fayliga yozing:  GROQ_API_KEY=gsk_...
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip().strip('"').strip("'")
+
+
+def describe_key(key):
+    """Kalitni to'liq ko'rsatmasdan tekshirish uchun: gsk_WmJO…vL00 (56 belgi)."""
+    if not key:
+        return "YO'Q"
+    return f"{key[:8]}…{key[-4:]} ({len(key)} belgi)"
+
+
+def show_key_info():
+    print(f"[AI] Ishlatilayotgan Groq kalit: {describe_key(GROQ_API_KEY)}, manba: {KEY_SOURCE['value']}")
+    if GROQ_API_KEY and (not GROQ_API_KEY.startswith("gsk_") or len(GROQ_API_KEY) != 56):
+        print("[AI] ⚠️ Groq kalitlari odatda 'gsk_' bilan boshlanadi va 56 belgidan iborat bo'ladi — "
+              "kalit noto'liq yoki xato ko'chirilgan bo'lishi mumkin.")
 
 ACCOUNTS_FILE = "accounts.json"
 DB_FILE = "replied_data.json"
@@ -123,6 +144,7 @@ def warn_bad_key(detail=""):
 
 
 def get_groq_models():
+    show_key_info()
     if not GROQ_API_KEY:
         warn_bad_key("GROQ_API_KEY topilmadi")
         return list(FAST_MODELS)
