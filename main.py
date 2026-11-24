@@ -5,6 +5,7 @@ import time
 import threading
 import random
 from collections import deque
+from datetime import datetime
 from urllib.parse import unquote
 
 import requests
@@ -19,6 +20,25 @@ from instagrapi.exceptions import (
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_builtin_print = print
+_print_lock = threading.Lock()
+
+
+def print(*args, **kwargs):
+    """Har bir log qatori boshida hozirgi vaqt: [24.11 21:40:05]. Bir nechta akkaunt bir vaqtda
+    yozganda qatorlar aralashib ketmasligi uchun lock ishlatiladi."""
+    stamp = datetime.now().strftime("%d.%m %H:%M:%S")
+    with _print_lock:
+        _builtin_print(f"[{stamp}]", *args, **kwargs)
+
+
+def fmt_time(ts):
+    """Xabar/izoh yozilgan vaqt (telefoningiz vaqt mintaqasida)."""
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%d.%m %H:%M:%S") if ts else "?"
+    except (TypeError, ValueError, OSError):
+        return "?"
 
 
 def load_dotenv(path):
@@ -94,7 +114,7 @@ def warn_bad_key(detail=""):
             return
         ai_status["last_warn"] = time.time()
     print(
-        "\n[AI] ❌ GROQ API KALIT NOTO'G'RI yoki YO'Q — hech bir akkaunt AI javob bera olmaydi!"
+        "[AI] ❌ GROQ API KALIT NOTO'G'RI yoki YO'Q — hech bir akkaunt AI javob bera olmaydi!"
         f"{(' (' + detail + ')') if detail else ''}\n"
         "     1) https://console.groq.com/keys dan yangi kalit oling\n"
         f"     2) {os.path.join(BASE_DIR, '.env')} fayliga yozing:  GROQ_API_KEY=gsk_...\n"
@@ -438,6 +458,13 @@ def extract_item_text(item):
     return item.get("text")
 
 
+def thread_sender_name(thread, sender_id):
+    for u in thread.get("users") or []:
+        if str(u.get("pk") or u.get("pk_id") or u.get("id") or "") == str(sender_id):
+            return u.get("username") or ""
+    return ""
+
+
 def thread_items(thread):
     items = thread.get("items") or []
     if not items and isinstance(thread.get("last_permanent_item"), dict):
@@ -660,7 +687,9 @@ def run_bot_for_account(acc):
                         break
                     thread_id = str(thread.get("thread_id"))
                     where = " [So'rov]" if pending else ""
-                    print(f"[{username}] 📩 Yangi xabar{where} (ID: {sender_id}): {user_text}")
+                    sender_name = thread_sender_name(thread, sender_id)
+                    who = f"@{sender_name}" if sender_name else f"ID: {sender_id}"
+                    print(f"[{username}] 📩 Yangi xabar{where} | {fmt_time(msg_ts)} da yozilgan | {who}: {user_text}")
 
                     ai_reply = get_dm_reply(business_info, behavior, user_text)
                     if not ai_reply:
@@ -736,7 +765,8 @@ def run_bot_for_account(acc):
                         if not text or _c_time(comment) < cutoff or is_replied("comments", comment_id):
                             continue
 
-                        print(f"[{username}] 💬 Yangi izoh (@{commenter_name}): {text}")
+                        print(f"[{username}] 💬 Yangi izoh | {fmt_time(_c_time(comment))} da yozilgan | "
+                              f"@{commenter_name}: {text}")
                         comment_reply, dm_reply = get_comment_and_dm_reply(business_info, behavior, text)
                         if not (comment_reply and dm_reply):
                             print(f"[{username}] ⚠️ AI javob bermadi, keyingi aylanishda qayta urinadi.")
