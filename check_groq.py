@@ -7,27 +7,17 @@ import requests
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
-env_path = os.path.join(BASE_DIR, ".env")
 
 print("Python:", sys.version.split()[0])
 print("Papka:", BASE_DIR)
-print(".env bormi:", os.path.exists(env_path))
-if os.path.exists(env_path):
-    with open(env_path, "rb") as f:
-        raw = f.read()
-    lines = raw.decode("utf-8-sig", errors="replace").splitlines()
-    print(f".env: {len(lines)} qator, {len(raw)} bayt")
-    for i, line in enumerate(lines, 1):
-        name = line.split("=", 1)[0].strip() if "=" in line else "(= yo'q)"
-        print(f"   {i}-qator nomi: {name!r}")
 print("Shell'dagi export GROQ_API_KEY:", "bor" if os.environ.get("GROQ_API_KEY") else "yo'q")
 
 # main.py bilan bir xil yo'l bilan kalitni o'qiymiz (main.py ni ishga tushirmasdan)
-from main import GROQ_API_KEY, KEY_SOURCE, describe_key  # noqa: E402
+from main import GROQ_API_KEY, describe_key  # noqa: E402
 
-print("\nIshlatiladigan kalit:", describe_key(GROQ_API_KEY), "| manba:", KEY_SOURCE["value"])
+print("\nIshlatiladigan kalit:", describe_key(GROQ_API_KEY))
 if not GROQ_API_KEY:
-    print("❌ Kalit topilmadi. .env fayliga: GROQ_API_KEY=gsk_... deb yozing.")
+    print("❌ Kalit topilmadi. main.py dagi GROQ_API_KEY qatoriga kalitni yozing.")
     sys.exit(1)
 
 headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
