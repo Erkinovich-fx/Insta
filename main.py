@@ -1,8 +1,12 @@
 import json
 import os
+import re
 import time
 import threading
 import random
+from collections import deque
+from urllib.parse import unquote
+
 import requests
 from instagrapi import Client
 from instagrapi.exceptions import (
@@ -14,9 +18,32 @@ from instagrapi.exceptions import (
     ClientThrottledError,
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_dotenv(path):
+    """.env faylidan KALIT=QIYMAT qatorlarini o'qiydi (Termux'da har safar export qilish shart emas)."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            value = value.strip().strip('"').strip("'")
+            if key and not os.environ.get(key):
+                os.environ[key] = value
+
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 # 1. GROQ AI SOZLAMASI
-# Kalitni .env / muhit o'zgaruvchisi orqali bering: export GROQ_API_KEY=...
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Kalitni main.py yonidagi .env fayliga yozing:  GROQ_API_KEY=gsk_...
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 
 ACCOUNTS_FILE = "accounts.json"
 DB_FILE = "replied_data.json"
@@ -24,32 +51,68 @@ DB_FILE = "replied_data.json"
 # Katta akkauntlar uchun sozlamalar
 # Tezlik: DM lar tez-tez, izohlar va so'rovlar kamroq tekshiriladi.
 # DM_POLL_DELAY ni juda kichik qilmang — Instagram ko'p so'rovda cheklov (PleaseWait) qo'yadi.
-DM_POLL_DELAY = (18, 26)          # Asosiy/Umumiy DM lar har necha sekundda tekshiriladi
+DM_POLL_DELAY = (18, 26)         # Asosiy/Umumiy DM lar har necha sekundda tekshiriladi
 PENDING_INTERVAL = 45            # So'rovlar (Requests) jildi har necha sekundda
 COMMENTS_INTERVAL = 90           # Izohlar har necha sekundda tekshiriladi
+DEEP_SCAN_INTERVAL = 300         # Har 5 daqiqada inbox chuqurroq (bir necha sahifa) o'qiladi
 REQUEST_DELAY = [0.3, 1.0]       # Har bir Instagram so'rovidan oldingi pauza (instagrapi)
-DM_THREADS_PER_BOX = 50          # Har bir jilddan nechta chat olinadi
-MEDIA_TO_WATCH = 10               # Eng yangi nechta post/reels kuzatiladi
+DM_THREADS_PER_BOX = 50          # Chuqur tekshiruvda har bir jilddan nechta chat olinadi
+PENDING_PAGES = 3                # So'rovlar jildidan nechta sahifa (har biri ~20 chat)
+MEDIA_TO_WATCH = 10              # Eng yangi nechta post/reels kuzatiladi
 MEDIA_REFRESH_SEC = 600          # Postlar ro'yxati har 10 daqiqada yangilanadi
-MAX_REPLIES_PER_CYCLE = 16        # Bir aylanishda maksimum javoblar (spam-blokdan himoya)
+COMMENT_PAGES = 3                # Har bir postdan nechta izoh sahifasi o'qiladi
+MAX_REPLIES_PER_CYCLE = 16       # Bir aylanishda maksimum javoblar (spam-blokdan himoya)
+MAX_REPLIES_PER_HOUR = 120       # Bir akkaunt uchun soatiga maksimum javob
 ACTION_DELAY = (2, 5)            # Har bir javobdan keyingi pauza
 DB_MAX_IDS = 20000               # Bazada saqlanadigan maksimum ID lar
+
+# Eski (bot ishga tushishidan oldingi) xabar/izohlarga ham javob berish.
+# 0 = faqat bot ishga tushgandan keyin kelganlariga javob beradi.
+DM_MAX_AGE_HOURS = 48            # Javobsiz qolgan DM / so'rovlarga necha soatgacha javob beriladi
+COMMENT_MAX_AGE_HOURS = 720      # Izohlarga necha soatgacha (720 = 30 kun) javob beriladi
 
 DEFAULT_BEHAVIOR = (
     "Sen juda xushmuomala yordamchisan. Mijoz qaysi tilda yozsa, o'sha tilda javob qaytar "
     "(asosan O'zbek tilida). Qisqa, lo'nda va kamida 2 ta emoji ishlat."
 )
 
+# Instagram cheklov/sessiya xatolari — bular yuqoriga uzatiladi va asosiy siklda qayta ishlanadi
+IG_FATAL_ERRORS = (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
+                   ChallengeRequired, ClientThrottledError, FeedbackRequired)
 
 FAST_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
+ai_status = {"key_invalid": False, "last_warn": 0}
+ai_lock = threading.Lock()
+
+
+def warn_bad_key(detail=""):
+    """API kalit xatosini har 5 daqiqada bir marta ko'rsatadi (log to'lib ketmasligi uchun)."""
+    with ai_lock:
+        ai_status["key_invalid"] = True
+        if time.time() - ai_status["last_warn"] < 300:
+            return
+        ai_status["last_warn"] = time.time()
+    print(
+        "\n[AI] ❌ GROQ API KALIT NOTO'G'RI yoki YO'Q — hech bir akkaunt AI javob bera olmaydi!"
+        f"{(' (' + detail + ')') if detail else ''}\n"
+        "     1) https://console.groq.com/keys dan yangi kalit oling\n"
+        f"     2) {os.path.join(BASE_DIR, '.env')} fayliga yozing:  GROQ_API_KEY=gsk_...\n"
+        "     3) Botni qayta ishga tushiring.\n"
+    )
+
 
 def get_groq_models():
+    if not GROQ_API_KEY:
+        warn_bad_key("GROQ_API_KEY topilmadi")
+        return list(FAST_MODELS)
     url = "https://api.groq.com/openai/v1/models"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
+        if res.status_code == 401:
+            warn_bad_key("Groq 401 Invalid API Key")
+        elif res.status_code == 200:
             all_models = [m["id"] for m in res.json().get("data", [])]
             chat_models = [
                 m for m in all_models
@@ -66,10 +129,11 @@ def get_groq_models():
                 if m not in preferred:
                     preferred.append(m)
             if preferred:
+                print(f"[AI] ✅ Groq kalit ishlayapti. Asosiy model: {preferred[0]}")
                 return preferred
     except Exception as e:
         print(f"[AI] Modellar ro'yxatini olishda xato: {e}")
-    return ["llama-3.3-70b-versatile"]
+    return list(FAST_MODELS)
 
 
 groq_session = requests.Session()  # ulanishni qayta ishlatadi (har safar yangi TLS emas)
@@ -143,6 +207,10 @@ def get_business_info(acc):
 
 # 2. AVTOMATIK JAVOBLAR (AI)
 def call_groq(system_prompt, user_prompt):
+    if not GROQ_API_KEY:
+        warn_bad_key("GROQ_API_KEY topilmadi")
+        return None
+
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -159,6 +227,7 @@ def call_groq(system_prompt, user_prompt):
         try:
             res = groq_session.post(url, headers=headers, json=data, timeout=15)
             if res.status_code == 200:
+                ai_status["key_invalid"] = False
                 reply = (res.json()["choices"][0]["message"].get("content") or "").strip()
                 if "</think>" in reply:
                     reply = reply.split("</think>")[-1].strip()
@@ -167,6 +236,10 @@ def call_groq(system_prompt, user_prompt):
                 reply = reply.replace("**", "").strip().strip('"').strip()
                 if reply:
                     return reply
+            elif res.status_code in (401, 403):
+                # Kalit noto'g'ri — boshqa modellarni sinash befoyda
+                warn_bad_key(f"Groq {res.status_code}: {res.text[:100]}")
+                return None
             elif res.status_code in (400, 404):
                 with models_lock:
                     if model_name in GROQ_MODELS and len(GROQ_MODELS) > 1:
@@ -206,33 +279,74 @@ def get_comment_and_dm_reply(business_info, behavior, user_text):
 
 
 # 3. AKKAUNTGA KIRISH
-def login_account(username, session_id):
-    """Dashboard'da "password" maydoniga Session ID (cookie) yoziladi."""
+def session_user_id(session_id):
+    """Session ID ning boshidagi raqam — shu akkauntning Instagram ID si (masalan 24419371704%3A...)."""
+    m = re.match(r"^\d+", unquote(session_id or "").strip())
+    return m.group() if m else ""
+
+
+def new_client():
     cl = Client()
     cl.delay_range = REQUEST_DELAY
+    return cl
+
+
+def whoami(cl):
+    """Haqiqatda qaysi akkauntga ulanganimizni qaytaradi (username, id)."""
+    result = cl.private_request("accounts/current_user/", params={"edit": "true"})
+    user = result.get("user") or {}
+    return user.get("username", ""), str(user.get("pk") or user.get("pk_id") or cl.user_id)
+
+
+def login_account(username, session_id):
+    """Dashboard'da "password" maydoniga Session ID (cookie) yoziladi.
+    accounts.json dagi Session ID har doim asosiy hisoblanadi: agar saqlangan session_*.json
+    boshqa Session ID / boshqa akkauntga tegishli bo'lsa, u tashlab yuboriladi."""
+    session_id = (session_id or "").strip()
+    expected_uid = session_user_id(session_id)
     session_file = f"session_{username}.json"
+    cl = None
 
     if os.path.exists(session_file):
         try:
+            cl = new_client()
             cl.load_settings(session_file)
-            # Eslatma: cl.login(username, session_id) chaqirilmaydi — session ID parol emas,
-            # noto'g'ri parol bilan qayta login katta akkauntlarda "challenge"/blok chaqiradi.
-            cl.account_info()
-            print(f"[{username}] ✅ Sessiya orqali muvaffaqiyatli kirildi! ⚡")
-            return cl
+            auth = cl.authorization_data or {}
+            saved_uid = str(auth.get("ds_user_id") or "")
+            saved_sid = unquote(str(auth.get("sessionid") or ""))
+            if expected_uid and saved_uid and saved_uid != expected_uid:
+                print(f"[{username}] ⚠️ {session_file} BOSHQA akkauntga tegishli (ID {saved_uid}), "
+                      f"accounts.json dagi Session ID esa ID {expected_uid} uchun. Eski fayl tashlab yuborildi.")
+                cl = None
+            elif saved_sid and session_id and saved_sid != unquote(session_id):
+                print(f"[{username}] ℹ️ accounts.json da yangi Session ID — o'shani ishlatamiz.")
+                cl = None
+            else:
+                # Eslatma: cl.login(username, session_id) chaqirilmaydi — session ID parol emas.
+                whoami(cl)
         except Exception as e:
             print(f"[{username}] ⚠️ Saqlangan sessiya ishlamadi ({e}), Session ID bilan qayta ulanilmoqda...")
-            cl = Client()
-            cl.delay_range = REQUEST_DELAY
+            cl = None
+
+    if cl is None:
+        try:
+            cl = new_client()
+            cl.login_by_sessionid(session_id)
+            cl.dump_settings(session_file)
+        except Exception as e:
+            print(f"[{username}] ❌ Login xatoligi: {e}")
+            print(f"[{username}]    Session ID eskirgan bo'lishi mumkin — brauzerdan yangi sessionid oling.")
+            return None
 
     try:
-        cl.login_by_sessionid(session_id.strip())
-        cl.dump_settings(session_file)
-        print(f"[{username}] ✅ Session ID orqali muvaffaqiyatli ulandi! ⚡")
-        return cl
-    except Exception as e:
-        print(f"[{username}] ❌ Login xatoligi: {e}")
-        return None
+        real_username, real_id = whoami(cl)
+    except Exception:
+        real_username, real_id = "", str(cl.user_id)
+    print(f"[{username}] ✅ Ulandi: @{real_username or '?'} (ID: {real_id}) ⚡")
+    if real_username and real_username.lower() != username.lower():
+        print(f"[{username}] ⚠️ DIQQAT: Session ID @{real_username} akkauntiga tegishli, @{username} ga emas! "
+              f"Bot @{real_username} nomidan ishlaydi. To'g'ri akkauntning Session ID sini kiriting.")
+    return cl
 
 
 # --- DM YORDAMCHI FUNKSIYALAR ---
@@ -240,42 +354,74 @@ def login_account(username, session_id):
 # tekshiradi. Katta akkauntlarda (reels ulashish, ovozli xabar, story javobi, xma va h.k.)
 # bitta "g'alati" xabar butun so'rovni ValidationError bilan yiqitadi va bot hech narsa
 # ko'rmaydi. Shuning uchun xom (raw) JSON o'zimiz o'qiymiz.
-def fetch_inbox_threads(cl, box=None, pending=False):
-    if pending:
-        params = {
-            "visual_message_return_type": "unseen",
-            "persistentBadging": "true",
-            "is_prefetching": "false",
-        }
-        result = cl.private_request("direct_v2/pending_inbox/", params=params)
-    else:
-        params = {
-            "visual_message_return_type": "unseen",
-            "thread_message_limit": "10",
-            "persistentBadging": "true",
-            "limit": str(DM_THREADS_PER_BOX),
-            "is_prefetching": "false",
-            "fetch_reason": "initial_snapshot",
-        }
-        if box:
-            # Biznes/Creator akkauntlarda: 0 = Asosiy (Primary), 1 = Umumiy (General)
-            params["folder"] = "1" if box == "general" else "0"
-        result = cl.private_request("direct_v2/inbox/", params=params)
-    return (result.get("inbox") or {}).get("threads") or []
+def fetch_inbox_threads(cl, box=None, pending=False, max_threads=20):
+    threads = []
+    cursor = None
+    while True:
+        if pending:
+            params = {
+                "visual_message_return_type": "unseen",
+                "persistentBadging": "true",
+                "is_prefetching": "false",
+                "request_session_id": cl.request_id,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            result = cl.private_request("direct_v2/pending_inbox/", params=params)
+        else:
+            params = {
+                "visual_message_return_type": "unseen",
+                "thread_message_limit": "10",
+                "persistentBadging": "true",
+                "limit": "20",
+                "is_prefetching": "false",
+                "fetch_reason": "initial_snapshot",
+            }
+            if box:
+                # Biznes/Creator akkauntlarda: 0 = Asosiy (Primary), 1 = Umumiy (General)
+                params["folder"] = "1" if box == "general" else "0"
+            if cursor:
+                params.update({"cursor": cursor, "direction": "older", "fetch_reason": "page_scroll"})
+            result = cl.private_request("direct_v2/inbox/", params=params)
+
+        inbox = result.get("inbox") or {}
+        threads.extend(inbox.get("threads") or [])
+        cursor = inbox.get("oldest_cursor")
+        if not cursor or not inbox.get("has_older", True) or len(threads) >= max_threads:
+            break
+    return threads[:max_threads]
 
 
-def fetch_inbox_threads_retry(cl, box=None, pending=False, attempts=3):
+def fetch_inbox_threads_retry(cl, box=None, pending=False, max_threads=20, attempts=3):
     """Vaqtinchalik tarmoq xatolarida (ConnectionError, timeout) bir necha marta qayta urinadi."""
     for attempt in range(1, attempts + 1):
         try:
-            return fetch_inbox_threads(cl, box=box, pending=pending)
-        except (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
-                ChallengeRequired, ClientThrottledError, FeedbackRequired):
+            return fetch_inbox_threads(cl, box=box, pending=pending, max_threads=max_threads)
+        except IG_FATAL_ERRORS:
             raise
         except Exception:
             if attempt == attempts:
                 raise
             time.sleep(3 * attempt)
+
+
+# Matnsiz xabarlar (reels/post ulashish, rasm, ovozli xabar...) — AI ga tushunarli tavsif
+MEDIA_ITEM_LABELS = {
+    "media_share": "post ulashdi",
+    "clip": "reels ulashdi",
+    "xma_clip": "reels ulashdi",
+    "xma_media_share": "post ulashdi",
+    "xma_reel_share": "reels ulashdi",
+    "story_share": "story ulashdi",
+    "xma_story_share": "story ulashdi",
+    "reel_share": "story'ga javob yozdi",
+    "media": "rasm/video yubordi",
+    "raven_media": "rasm/video yubordi",
+    "voice_media": "ovozli xabar yubordi",
+    "animated_media": "GIF yubordi",
+    "felix_share": "video ulashdi",
+    "profile": "profil ulashdi",
+}
 
 
 def extract_item_text(item):
@@ -292,10 +438,18 @@ def extract_item_text(item):
     return item.get("text")
 
 
+def thread_items(thread):
+    items = thread.get("items") or []
+    if not items and isinstance(thread.get("last_permanent_item"), dict):
+        # So'rovlar (pending) jildida ba'zan faqat oxirgi xabar keladi
+        items = [thread["last_permanent_item"]]
+    return items
+
+
 def collect_new_user_text(thread, my_user_id):
     """Chatdagi oxirgi (bizdan keyingi) mijoz xabarlarini yig'adi.
     Qaytaradi: (oxirgi_xabar_id, oxirgi_xabar_vaqti_sekund, sender_id, birlashtirilgan_matn)"""
-    items = thread.get("items") or []
+    items = thread_items(thread)
     if not items:
         return None
     last = items[0]  # eng yangi xabar
@@ -304,12 +458,17 @@ def collect_new_user_text(thread, my_user_id):
         return None
 
     texts = []
+    media_note = None
     for item in items:
         if str(item.get("user_id", "")) == my_user_id:
             break
         text = extract_item_text(item)
         if text:
             texts.append(text.strip())
+        elif media_note is None and item.get("item_type") in MEDIA_ITEM_LABELS:
+            media_note = f"(Mijoz {MEDIA_ITEM_LABELS[item['item_type']]})"
+    if not texts and media_note:
+        texts = [media_note]
     if not texts:
         return None
     texts.reverse()
@@ -324,11 +483,10 @@ def collect_new_user_text(thread, my_user_id):
 # --- IZOH YORDAMCHI FUNKSIYALAR ---
 def fetch_recent_medias(cl, my_user_id):
     """Eng yangi postlar va reels. Katta akkauntlarda tepada 3 ta "pinned" (qadalgan) eski post
-    bo'ladi — user_medias(amount=3) faqat o'shalarni qaytarar edi va yangi reels'lar umuman
-    tekshirilmas edi. Shuning uchun ko'proq olib, sana bo'yicha saralaymiz."""
+    bo'ladi — shuning uchun ko'proq olib, sana bo'yicha saralaymiz."""
     result = cl.private_request(
         f"feed/user/{my_user_id}/",
-        params={"count": 15, "rank_token": cl.rank_token, "ranked_content": "true"},
+        params={"count": max(15, MEDIA_TO_WATCH + 5), "rank_token": cl.rank_token, "ranked_content": "true"},
     )
     items = result.get("items") or []
     items = [i for i in items if i.get("pk") and not i.get("comments_disabled")]
@@ -336,16 +494,58 @@ def fetch_recent_medias(cl, my_user_id):
     return [{"pk": str(i["pk"]), "id": str(i.get("id") or i["pk"])} for i in items[:MEDIA_TO_WATCH]]
 
 
-def fetch_recent_comments(cl, media_pk):
-    """Katta postlarda Instagram izohlarni "mashhurlik" bo'yicha beradi, yangi izoh birinchi 5 ta
-    ichida bo'lmaydi. Shuning uchun birinchi sahifani to'liq olib, vaqt bo'yicha saralaymiz."""
-    result = cl.private_request(
-        f"media/{media_pk}/comments/",
-        params={"can_support_threading": "true", "sort_order": "newest"},
-    )
-    comments = result.get("comments") or []
-    comments.sort(key=lambda c: c.get("created_at_utc") or c.get("created_at") or 0, reverse=True)
+def fetch_comments(cl, media_pk):
+    """Postdagi izohlar (bir necha sahifa). Katta postlarda Instagram izohlarni "mashhurlik"
+    bo'yicha beradi, shuning uchun ko'proq olib, keyin vaqt bo'yicha saralaymiz."""
+    comments = []
+    params = {"can_support_threading": "true", "sort_order": "newest"}
+    for _ in range(COMMENT_PAGES):
+        result = cl.private_request(f"media/{media_pk}/comments/", params=params)
+        comments.extend(result.get("comments") or [])
+        if result.get("has_more_comments") and result.get("next_max_id"):
+            params = {"can_support_threading": "true", "max_id": result["next_max_id"]}
+        elif result.get("has_more_headload_comments") and result.get("next_min_id"):
+            params = {"can_support_threading": "true", "min_id": result["next_min_id"]}
+        else:
+            break
     return comments
+
+
+def _c_user_id(c):
+    user = c.get("user") or {}
+    return str(user.get("pk") or user.get("id") or c.get("user_id") or "")
+
+
+def _c_time(c):
+    return c.get("created_at_utc") or c.get("created_at") or 0
+
+
+def build_comment_candidates(comments, my_user_id):
+    """Javob berilishi kerak bo'lgan izohlar: asosiy izohlar + ularga yozilgan javoblar (child).
+    Biz allaqachon javob yozgan izohlar o'tkazib yuboriladi.
+    Qaytaradi: [(izoh, javob_yoziladigan_asosiy_izoh_pk), ...] — eng yangisi birinchi."""
+    seen = set()
+    out = []
+    for c in comments:
+        top_pk = str(c.get("pk") or c.get("id") or "")
+        if not top_pk or top_pk in seen:
+            continue
+        seen.add(top_pk)
+        children = c.get("preview_child_comments") or []
+        my_reply_times = [_c_time(ch) for ch in children if _c_user_id(ch) == my_user_id]
+
+        if _c_user_id(c) != my_user_id and not my_reply_times:
+            out.append((c, top_pk))
+        for ch in children:
+            ch_pk = str(ch.get("pk") or ch.get("id") or "")
+            if not ch_pk or ch_pk in seen or _c_user_id(ch) == my_user_id:
+                continue
+            seen.add(ch_pk)
+            if any(t >= _c_time(ch) for t in my_reply_times):
+                continue  # bu javobdan keyin biz allaqachon yozganmiz
+            out.append((ch, top_pk))  # Instagram'da javob har doim asosiy izoh ostiga yoziladi
+    out.sort(key=lambda pair: _c_time(pair[0]), reverse=True)
+    return out
 
 
 # 4. ASOSIY ISHCHI FUNKSIYA
@@ -359,20 +559,43 @@ def run_bot_for_account(acc):
 
     my_user_id = str(cl.user_id)
     # Vaqtni UTC epoch (sekund) da saqlaymiz — timezone muammolari bo'lmaydi.
-    # (instagrapi DM vaqtini lokal vaqtda, izoh vaqtini UTC da qaytarar edi — solishtirish noto'g'ri edi)
     bot_start_ts = time.time()
+
+    def dm_cutoff():
+        return time.time() - DM_MAX_AGE_HOURS * 3600 if DM_MAX_AGE_HOURS > 0 else bot_start_ts
+
+    def comment_cutoff():
+        return time.time() - COMMENT_MAX_AGE_HOURS * 3600 if COMMENT_MAX_AGE_HOURS > 0 else bot_start_ts
+
+    sent_times = deque()  # soatlik limit uchun
+
+    def can_reply(replies_this_cycle):
+        now = time.time()
+        while sent_times and now - sent_times[0] > 3600:
+            sent_times.popleft()
+        return replies_this_cycle < MAX_REPLIES_PER_CYCLE and len(sent_times) < MAX_REPLIES_PER_HOUR
 
     medias_cache = []
     next_pending_ts = 0
     next_comments_ts = 0
+    next_deep_scan_ts = 0
     medias_cache_ts = 0
     error_streak = 0
+    last_pending_count = None
+    hour_limit_warned = 0
 
     print(f"[{username}] 🚀 Bot ishga tushdi! (Asosiy, Umumiy va So'rovlar jildlari kuzatilmoqda...)")
 
     while True:
         try:
             cfg = load_account_config(username) or acc
+            if cfg.get("password") and cfg["password"] != session_id:
+                # Dashboard'da Session ID yangilangan — qayta ulanamiz
+                print(f"[{username}] 🔄 accounts.json da yangi Session ID, qayta ulanilmoqda...")
+                new_cl = login_account(username, cfg["password"])
+                if new_cl:
+                    cl, session_id = new_cl, cfg["password"]
+                    my_user_id = str(cl.user_id)
             business_info = get_business_info(cfg)
             behavior = cfg.get("behavior") or DEFAULT_BEHAVIOR
             automation = cfg.get("automation") or {}
@@ -380,8 +603,20 @@ def run_bot_for_account(acc):
             auto_comment = automation.get("auto_comment", True)
             replies_this_cycle = 0
 
+            if ai_status["key_invalid"]:
+                warn_bad_key()
+
+            if not can_reply(0) and time.time() - hour_limit_warned > 600:
+                hour_limit_warned = time.time()
+                print(f"[{username}] ⏸ Soatlik limit ({MAX_REPLIES_PER_HOUR} ta javob) tugadi, biroz kutiladi.")
+
             # --- A. BARCHA DIRECT (DM) XABARLARNI TEKSHIRISH ---
-            if auto_dm:
+            if auto_dm and can_reply(0):
+                deep = time.time() >= next_deep_scan_ts
+                if deep:
+                    next_deep_scan_ts = time.time() + DEEP_SCAN_INTERVAL
+                box_limit = DM_THREADS_PER_BOX if deep else 20
+
                 threads = []  # (thread, pending)
                 seen_thread_ids = set()
                 sources = [("primary", False), ("general", False)]
@@ -389,40 +624,56 @@ def run_bot_for_account(acc):
                     sources.append((None, True))
                     next_pending_ts = time.time() + PENDING_INTERVAL
                 for box, pending in sources:
+                    limit = PENDING_PAGES * 20 if pending else box_limit
                     try:
-                        for t in fetch_inbox_threads_retry(cl, box=box, pending=pending):
-                            tid = str(t.get("thread_id", ""))
-                            if tid and tid not in seen_thread_ids:
-                                seen_thread_ids.add(tid)
-                                threads.append((t, pending))
-                    except (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
-                            ChallengeRequired, ClientThrottledError):
+                        found = fetch_inbox_threads_retry(cl, box=box, pending=pending, max_threads=limit)
+                    except IG_FATAL_ERRORS:
                         raise
                     except Exception as e:
                         name = "So'rovlar" if pending else box
-                        print(f"[{username}] ⚠️ DM ({name}) jildini o'qishda xato: {e}")
+                        print(f"[{username}] ⚠️ DM ({name}) jildini o'qishda xato: {type(e).__name__}: {e}")
+                        continue
+                    if pending and len(found) != last_pending_count:
+                        last_pending_count = len(found)
+                        print(f"[{username}] 📥 So'rovlar (Requests) jildida {len(found)} ta chat.")
+                    for t in found:
+                        tid = str(t.get("thread_id", ""))
+                        if tid and tid not in seen_thread_ids:
+                            seen_thread_ids.add(tid)
+                            threads.append((t, pending))
 
+                # Eng yangi xabarlar birinchi
+                candidates = []
+                cutoff = dm_cutoff()
                 for thread, pending in threads:
-                    if replies_this_cycle >= MAX_REPLIES_PER_CYCLE:
-                        break
                     info = collect_new_user_text(thread, my_user_id)
                     if not info:
                         continue
                     msg_id, msg_ts, sender_id, user_text = info
-                    if msg_ts < bot_start_ts or is_replied("messages", msg_id):
+                    if msg_ts < cutoff or is_replied("messages", msg_id):
                         continue
+                    candidates.append((msg_ts, thread, pending, info))
+                candidates.sort(key=lambda x: x[0], reverse=True)
 
+                for _, thread, pending, (msg_id, msg_ts, sender_id, user_text) in candidates:
+                    if not can_reply(replies_this_cycle):
+                        break
                     thread_id = str(thread.get("thread_id"))
-                    print(f"[{username}] 📩 Yangi xabar (ID: {sender_id}): {user_text}")
+                    where = " [So'rov]" if pending else ""
+                    print(f"[{username}] 📩 Yangi xabar{where} (ID: {sender_id}): {user_text}")
 
                     ai_reply = get_dm_reply(business_info, behavior, user_text)
                     if not ai_reply:
                         print(f"[{username}] ⚠️ AI javob bermadi, keyingi aylanishda qayta urinadi.")
+                        if ai_status["key_invalid"]:
+                            break  # kalit noto'g'ri — boshqa xabarlarni ham sinash befoyda
                         continue
 
                     if pending:
                         try:
                             cl.direct_pending_approve(int(thread_id))
+                        except IG_FATAL_ERRORS:
+                            raise
                         except Exception as e:
                             print(f"[{username}] ⚠️ So'rovni qabul qilishda xato: {e}")
 
@@ -430,13 +681,14 @@ def run_bot_for_account(acc):
                     try:
                         cl.direct_answer(int(thread_id), ai_reply)
                         sent = True
-                    except (LoginRequired, PleaseWaitFewMinutes, RateLimitError, FeedbackRequired,
-                            ChallengeRequired, ClientThrottledError):
+                    except IG_FATAL_ERRORS:
                         raise
                     except Exception:
                         try:
                             cl.direct_send(ai_reply, user_ids=[int(sender_id)])
                             sent = True
+                        except IG_FATAL_ERRORS:
+                            raise
                         except Exception as de:
                             print(f"[{username}] ❌ Javob yozishda xato: {de}")
 
@@ -444,63 +696,62 @@ def run_bot_for_account(acc):
                         print(f"[{username}] ✅ Javob yuborildi: {ai_reply}")
                         mark_replied("messages", msg_id)
                         replies_this_cycle += 1
+                        sent_times.append(time.time())
                         time.sleep(random.uniform(*ACTION_DELAY))
 
             # --- B. REELS VA POST IZOHLARI ---
-            if (auto_comment and replies_this_cycle < MAX_REPLIES_PER_CYCLE
+            if (auto_comment and can_reply(replies_this_cycle)
+                    and not ai_status["key_invalid"]
                     and time.time() >= next_comments_ts):
                 next_comments_ts = time.time() + COMMENTS_INTERVAL
                 if not medias_cache or time.time() - medias_cache_ts > MEDIA_REFRESH_SEC:
                     try:
                         medias_cache = fetch_recent_medias(cl, my_user_id)
                         medias_cache_ts = time.time()
-                    except (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
-                            ChallengeRequired, ClientThrottledError):
+                    except IG_FATAL_ERRORS:
                         raise
                     except Exception as e:
                         print(f"[{username}] ⚠️ Postlarni olishda xato: {e}")
 
+                cutoff = comment_cutoff()
                 for media in medias_cache:
-                    if replies_this_cycle >= MAX_REPLIES_PER_CYCLE:
+                    if not can_reply(replies_this_cycle):
                         break
                     try:
-                        comments = fetch_recent_comments(cl, media["pk"])
-                    except (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
-                            ChallengeRequired, ClientThrottledError):
+                        comments = fetch_comments(cl, media["pk"])
+                    except IG_FATAL_ERRORS:
                         raise
                     except Exception as e:
                         print(f"[{username}] ⚠️ Izohlarni olishda xato ({media['pk']}): {e}")
                         continue
 
-                    for comment in comments:
-                        if replies_this_cycle >= MAX_REPLIES_PER_CYCLE:
+                    for comment, reply_to_pk in build_comment_candidates(comments, my_user_id):
+                        if not can_reply(replies_this_cycle):
                             break
                         comment_id = str(comment.get("pk") or comment.get("id") or "")
-                        user = comment.get("user") or {}
-                        commenter_id = str(user.get("pk") or user.get("id") or comment.get("user_id") or "")
-                        commenter_name = user.get("username", "")
+                        commenter_id = _c_user_id(comment)
+                        commenter_name = (comment.get("user") or {}).get("username", "")
                         text = (comment.get("text") or "").strip()
-                        created = comment.get("created_at_utc") or comment.get("created_at") or 0
 
-                        if (not comment_id or not text or commenter_id == my_user_id
-                                or created < bot_start_ts or is_replied("comments", comment_id)):
+                        if not text or _c_time(comment) < cutoff or is_replied("comments", comment_id):
                             continue
 
                         print(f"[{username}] 💬 Yangi izoh (@{commenter_name}): {text}")
                         comment_reply, dm_reply = get_comment_and_dm_reply(business_info, behavior, text)
                         if not (comment_reply and dm_reply):
                             print(f"[{username}] ⚠️ AI javob bermadi, keyingi aylanishda qayta urinadi.")
+                            if ai_status["key_invalid"]:
+                                break
                             continue
 
                         try:
                             cl.media_comment(
                                 media["id"],
                                 f"@{commenter_name} {comment_reply}" if commenter_name else comment_reply,
-                                replied_to_comment_id=int(comment_id),
+                                replied_to_comment_id=int(reply_to_pk),
                             )
                             print(f"[{username}] ✅ Izohga javob: {comment_reply}")
-                        except (LoginRequired, PleaseWaitFewMinutes, RateLimitError, FeedbackRequired,
-                                ChallengeRequired, ClientThrottledError):
+                        except IG_FATAL_ERRORS:
                             raise
                         except Exception as ce:
                             print(f"[{username}] ❌ Izoh yozishda xato: {ce}")
@@ -509,14 +760,14 @@ def run_bot_for_account(acc):
                             try:
                                 cl.direct_send(dm_reply, user_ids=[int(commenter_id)])
                                 print(f"[{username}] ✅ DM yuborildi: {dm_reply}")
-                            except (LoginRequired, PleaseWaitFewMinutes, RateLimitError, FeedbackRequired,
-                                    ChallengeRequired, ClientThrottledError):
+                            except IG_FATAL_ERRORS:
                                 raise
                             except Exception as de:
                                 print(f"[{username}] ❌ DM yuborishda xato: {de}")
 
                         mark_replied("comments", comment_id)
                         replies_this_cycle += 1
+                        sent_times.append(time.time())
                         time.sleep(random.uniform(*ACTION_DELAY))
 
             error_streak = 0
