@@ -16,7 +16,7 @@ from instagrapi.exceptions import (
 
 # 1. GROQ AI SOZLAMASI
 # Kalitni .env / muhit o'zgaruvchisi orqali bering: export GROQ_API_KEY=...
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or "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"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 ACCOUNTS_FILE = "accounts.json"
 DB_FILE = "replied_data.json"
@@ -24,14 +24,14 @@ DB_FILE = "replied_data.json"
 # Katta akkauntlar uchun sozlamalar
 # Tezlik: DM lar tez-tez, izohlar va so'rovlar kamroq tekshiriladi.
 # DM_POLL_DELAY ni juda kichik qilmang — Instagram ko'p so'rovda cheklov (PleaseWait) qo'yadi.
-DM_POLL_DELAY = (8, 14)          # Asosiy/Umumiy DM lar har necha sekundda tekshiriladi
+DM_POLL_DELAY = (18, 26)          # Asosiy/Umumiy DM lar har necha sekundda tekshiriladi
 PENDING_INTERVAL = 45            # So'rovlar (Requests) jildi har necha sekundda
 COMMENTS_INTERVAL = 90           # Izohlar har necha sekundda tekshiriladi
 REQUEST_DELAY = [0.3, 1.0]       # Har bir Instagram so'rovidan oldingi pauza (instagrapi)
-DM_THREADS_PER_BOX = 20          # Har bir jilddan nechta chat olinadi
-MEDIA_TO_WATCH = 6               # Eng yangi nechta post/reels kuzatiladi
+DM_THREADS_PER_BOX = 50          # Har bir jilddan nechta chat olinadi
+MEDIA_TO_WATCH = 10               # Eng yangi nechta post/reels kuzatiladi
 MEDIA_REFRESH_SEC = 600          # Postlar ro'yxati har 10 daqiqada yangilanadi
-MAX_REPLIES_PER_CYCLE = 8        # Bir aylanishda maksimum javoblar (spam-blokdan himoya)
+MAX_REPLIES_PER_CYCLE = 16        # Bir aylanishda maksimum javoblar (spam-blokdan himoya)
 ACTION_DELAY = (2, 5)            # Har bir javobdan keyingi pauza
 DB_MAX_IDS = 20000               # Bazada saqlanadigan maksimum ID lar
 
