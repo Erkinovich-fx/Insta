@@ -41,23 +41,19 @@ def fmt_time(ts):
         return "?"
 
 
-# 1. GROQ AI SOZLAMASI
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or "gsk_*****"
-GROQ_API_KEY = GROQ_API_KEY.strip().strip('"').strip("'")  # nusxalashda qolgan bo'shliq/qo'shtirnoqni olib tashlaydi
+# 1. AI SOZLAMALARI
+# Bot bir nechta bepul AI xizmatidan foydalanadi: biri kunlik limitga yetsa, avtomatik keyingisiga
+# o'tadi (yuqoridagisi birinchi). Kalitni qo'shtirnoq ichiga yozing. Bir xizmatdan bir nechta kalit
+# bo'lsa vergul bilan yozing: "kalit1,kalit2". "*****" qolgan qatorlar e'tiborga olinmaydi.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "AIza*****"              # 1 (TAVSIYA): https://aistudio.google.com/apikey
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY") or "csk-*****"          # 2: https://cloud.cerebras.ai
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or "gsk_*****"                  # 3: https://console.groq.com/keys
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or "sk-or-*****"    # 4: https://openrouter.ai/keys
 
 
 def describe_key(key):
-    """Kalitni to'liq ko'rsatmasdan tekshirish uchun: gsk_WmJO…vL00 (56 belgi)."""
+    """Kalitni to'liq ko'rsatmasdan: gsk_WmJO…vL00 (56 belgi)."""
     return f"{key[:8]}…{key[-4:]} ({len(key)} belgi)" if key else "YO'Q"
-
-
-def show_key_info():
-    print(f"[AI] Ishlatilayotgan Groq kalit: {describe_key(GROQ_API_KEY)}")
-    if "*" in GROQ_API_KEY:
-        print("[AI] ⚠️ main.py dagi \"gsk_*****\" o'rniga o'zingizning Groq kalitingizni yozing!")
-    elif os.getenv("GROQ_API_KEY"):
-        print("[AI] ℹ️ Kalit Termux'dagi export GROQ_API_KEY dan olindi (main.py dagisi emas). "
-              "main.py dagisini ishlatish uchun: unset GROQ_API_KEY")
 
 
 ACCOUNTS_FILE = "accounts.json"
@@ -95,66 +91,264 @@ DEFAULT_BEHAVIOR = (
 IG_FATAL_ERRORS = (LoginRequired, PleaseWaitFewMinutes, RateLimitError,
                    ChallengeRequired, ClientThrottledError, FeedbackRequired)
 
-FAST_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+# --- AI XIZMATLARI (bir nechta, avtomatik almashinadi) ---
+def _parse_keys(raw):
+    keys = []
+    for k in (raw or "").split(","):
+        k = k.strip().strip('"').strip("'").strip()
+        if k and "*" not in k:
+            keys.append(k)
+    return keys
 
-ai_status = {"key_invalid": False, "last_warn": 0}
+
+def _version(model_id):
+    m = re.search(r"(\d+(?:\.\d+)?)", model_id)
+    return float(m.group(1)) if m else 0.0
+
+
+def _rank_by_keywords(keywords):
+    def rank(model_id):
+        mid = model_id.lower()
+        for i, kw in enumerate(keywords):
+            if kw in mid:
+                return (i, -_version(mid))
+        return (len(keywords), -_version(mid))
+    return rank
+
+
+AI_PROVIDERS = [
+    {
+        "name": "Gemini",
+        "keys": _parse_keys(GEMINI_API_KEY),
+        "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+        # flash-lite: eng tez, eng ko'p bepul limit, "o'ylash" (thinking) o'chiq
+        "models": ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
+        "include": lambda m: "gemini" in m and "flash" in m and not any(
+            x in m for x in ("image", "tts", "audio", "live", "embedding", "thinking", "exp", "native", "computer")),
+        # Barqaror (preview emas) birinchi, keyin eng yangi versiya, bir versiya ichida lite -> flash
+        "rank": lambda m: ("preview" in m, -_version(m), "lite" not in m),
+        # Gemini'da max_tokens ichiga "o'ylash" tokenlari ham kiradi — cheklasak javob bo'sh qoladi
+        "max_tokens": None,
+    },
+    {
+        "name": "Cerebras",
+        "keys": _parse_keys(CEREBRAS_API_KEY),
+        "base": "https://api.cerebras.ai/v1",
+        "models": ["llama-3.3-70b", "gpt-oss-120b", "qwen-3-32b", "llama3.1-8b"],
+        "include": lambda m: True,
+        "rank": _rank_by_keywords(["llama-3.3", "llama-4", "gpt-oss", "qwen", "llama"]),
+        "max_tokens": 400,
+    },
+    {
+        "name": "Groq",
+        "keys": _parse_keys(GROQ_API_KEY),
+        "base": "https://api.groq.com/openai/v1",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        "include": lambda m: not any(x in m for x in ("whisper", "guard", "vision", "tts", "audio", "embed", "compound")),
+        "rank": _rank_by_keywords(["llama-3.3-70b", "llama-4", "llama-3.1-8b", "gemma", "gpt-oss", "kimi", "qwen", "deepseek"]),
+        "max_tokens": 400,
+    },
+    {
+        "name": "OpenRouter",
+        "keys": _parse_keys(OPENROUTER_API_KEY),
+        "base": "https://openrouter.ai/api/v1",
+        "models": ["meta-llama/llama-3.3-70b-instruct:free", "google/gemma-3-27b-it:free"],
+        "include": lambda m: m.endswith(":free"),
+        "rank": _rank_by_keywords(["llama-3.3-70b", "gemini", "gemma-3-27b", "deepseek", "qwen", "mistral", "llama"]),
+        "max_tokens": 400,
+        "max_models": 5,
+    },
+]
+
+http = requests.Session()  # ulanishni qayta ishlatadi (har safar yangi TLS emas)
 ai_lock = threading.Lock()
+ai_status = {"down": False, "last_warn": 0, "current": None}
+_cooldown = {}        # (xizmat, kalit, model yoki None) -> qachongacha kutish (epoch)
+_dead_models = set()  # (xizmat, model) — mavjud bo'lmagan modellar
+_warned = set()
 
 
-def warn_bad_key(detail=""):
-    """API kalit xatosini har 5 daqiqada bir marta ko'rsatadi (log to'lib ketmasligi uchun)."""
+def _auth(key):
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+def _warn_once(tag, text):
     with ai_lock:
-        ai_status["key_invalid"] = True
-        if time.time() - ai_status["last_warn"] < 300:
+        if tag in _warned:
             return
-        ai_status["last_warn"] = time.time()
-    print(
-        "[AI] ❌ GROQ API KALIT NOTO'G'RI yoki YO'Q — hech bir akkaunt AI javob bera olmaydi!"
-        f"{(' (' + detail + ')') if detail else ''}\n"
-        "     1) https://console.groq.com/keys dan yangi kalit oling\n"
-        "     2) main.py dagi  GROQ_API_KEY = os.getenv(\"GROQ_API_KEY\") or \"gsk_...\"  qatoriga yozing\n"
-        "     3) Botni qayta ishga tushiring.\n"
-    )
+        _warned.add(tag)
+    print(text)
 
 
-def get_groq_models():
-    show_key_info()
-    if not GROQ_API_KEY:
-        warn_bad_key("GROQ_API_KEY topilmadi")
-        return list(FAST_MODELS)
-    url = "https://api.groq.com/openai/v1/models"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+def _set_cooldown(slot, seconds):
+    with ai_lock:
+        _cooldown[slot] = max(_cooldown.get(slot, 0), time.time() + seconds)
+
+
+def _cooled(slot):
+    with ai_lock:
+        return _cooldown.get(slot, 0) > time.time()
+
+
+def _retry_after(res):
+    """429 javobidan qancha kutish kerakligini aniqlaydi (sekund)."""
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 401:
-            warn_bad_key("Groq 401 Invalid API Key")
-        elif res.status_code == 200:
-            all_models = [m["id"] for m in res.json().get("data", [])]
-            chat_models = [
-                m for m in all_models
-                if not any(x in m.lower() for x in ["whisper", "guard", "vision", "tts", "audio", "embed"])
-            ]
-            # Tez, "o'ylamaydigan" modellar birinchi. qwen/deepseek kabi reasoning modellar
-            # avval <think> yozadi — sekin va max_tokens da javob kesilib qolishi mumkin.
-            preferred = [m for m in FAST_MODELS if m in chat_models]
-            for keyword in ["llama", "gemma", "mixtral", "qwen", "deepseek"]:
-                for m in chat_models:
-                    if keyword in m.lower() and m not in preferred:
-                        preferred.append(m)
-            for m in chat_models:
-                if m not in preferred:
-                    preferred.append(m)
-            if preferred:
-                print(f"[AI] ✅ Groq kalit ishlayapti. Asosiy model: {preferred[0]}")
-                return preferred
+        if res.headers.get("retry-after"):
+            return min(max(float(res.headers["retry-after"]), 5), 6 * 3600)
+    except (TypeError, ValueError):
+        pass
+    text = res.text or ""
+    m = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", text)
+    if m and any(m.groups()):
+        h, mi, s = (float(x) if x else 0 for x in m.groups())
+        return min(max(h * 3600 + mi * 60 + s, 5), 6 * 3600)
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+)', text)
+    if m:
+        return min(max(float(m.group(1)), 5), 6 * 3600)
+    if re.search(r"per.?day|perday|daily|tpd|rpd", text, re.I):
+        return 3600  # kunlik limit — 1 soatdan keyin yana tekshiramiz
+    return 60
+
+
+def _discover_models(p):
+    """Xizmatning hozirgi modellar ro'yxatini oladi (modellar nomi vaqt o'tib o'zgaradi)."""
+    key = p["keys"][0]
+    try:
+        res = http.get(f"{p['base']}/models", headers=_auth(key), timeout=15)
     except Exception as e:
-        print(f"[AI] Modellar ro'yxatini olishda xato: {e}")
-    return list(FAST_MODELS)
+        print(f"[AI] {p['name']}: modellar ro'yxatini olib bo'lmadi ({type(e).__name__}), standart ro'yxat ishlatiladi.")
+        return
+    if res.status_code != 200:
+        print(f"[AI] {p['name']}: /models javobi {res.status_code} — {res.text[:150]}")
+        return
+    try:
+        data = res.json()
+        items = data.get("data") or data.get("models") or []
+        ids = [str(m.get("id") or m.get("name") or "").replace("models/", "") for m in items]
+    except Exception:
+        return
+    ids = sorted({i for i in ids if i and p["include"](i.lower())}, key=lambda i: p["rank"](i.lower()))
+    if ids:
+        p["models"] = ids[: p.get("max_models", 6)]
 
 
-groq_session = requests.Session()  # ulanishni qayta ishlatadi (har safar yangi TLS emas)
-GROQ_MODELS = get_groq_models()
-models_lock = threading.Lock()
+def init_ai():
+    active = [p for p in AI_PROVIDERS if p["keys"]]
+    if not active:
+        print("[AI] ❌ HECH BIR AI KALIT YOZILMAGAN! main.py boshidagi GEMINI_API_KEY (tavsiya) qatoriga kalit yozing:\n"
+              "     https://aistudio.google.com/apikey  dan bepul kalit oling.")
+        return
+    for p in AI_PROVIDERS:
+        if not p["keys"]:
+            continue
+        _discover_models(p)
+        keys = ", ".join(describe_key(k) for k in p["keys"])
+        print(f"[AI] {p['name']}: {len(p['keys'])} ta kalit ({keys}) | modellar: {', '.join(p['models'][:4])}")
+
+
+def _handle_error(p, key, model, res):
+    name, text = p["name"], (res.text or "")[:300]
+    low = text.lower()
+    if res.status_code == 429:
+        wait = _retry_after(res)
+        _set_cooldown((name, key, model), wait)
+        print(f"[AI] {name} / {model}: limit tugadi, {int(wait // 60)} daq {int(wait % 60)} s dam oladi → keyingisiga o'tildi.")
+    elif "location is not supported" in low or "not available in your country" in low or "unsupported_country" in low:
+        _set_cooldown((name, key, None), 6 * 3600)
+        _warn_once(("region", name), f"[AI] ❌ {name} sizning mamlakatingizda ishlamaydi (VPN kerak). Boshqa xizmatlar ishlatiladi.")
+    elif res.status_code in (401, 403) or "api key not valid" in low or "invalid api key" in low or "api_key_invalid" in low:
+        _set_cooldown((name, key, None), 3600)
+        _warn_once(("key", name, key), f"[AI] ❌ {name} kaliti noto'g'ri yoki o'chirilgan: {describe_key(key)} ({res.status_code}). "
+                                       f"Boshqa kalit/xizmat ishlatiladi.")
+    elif res.status_code in (400, 404) and ("model" in low or res.status_code == 404):
+        with ai_lock:
+            _dead_models.add((name, model))
+        print(f"[AI] {name}: '{model}' modeli ishlamaydi ({res.status_code}), ro'yxatdan chiqarildi.")
+    elif res.status_code == 402:
+        _set_cooldown((name, key, None), 6 * 3600)
+        _warn_once(("pay", name, key), f"[AI] ❌ {name}: balans/bepul limit tugagan (402).")
+    else:
+        _set_cooldown((name, key, model), 20)
+        print(f"[AI] {name} / {model}: xato {res.status_code}: {text[:150]}")
+
+
+def ai_available():
+    """Hozir kamida bitta AI (kalit + model) limitda emasmi?"""
+    for p in AI_PROVIDERS:
+        for key in p["keys"]:
+            if _cooled((p["name"], key, None)):
+                continue
+            for m in p["models"]:
+                if (p["name"], m) not in _dead_models and not _cooled((p["name"], key, m)):
+                    return True
+    return False
+
+
+def _clean_reply(reply):
+    reply = (reply or "").strip()
+    if "</think>" in reply:
+        reply = reply.split("</think>")[-1].strip()
+    elif "<think>" in reply:
+        return ""  # fikrlash tugamay kesilgan
+    return reply.replace("**", "").strip().strip('"').strip()
+
+
+def call_ai(system_prompt, user_prompt):
+    """Birinchi ishlayotgan AI xizmatidan javob oladi. Limit tugasa — keyingisiga o'tadi."""
+    for p in AI_PROVIDERS:
+        for key in p["keys"]:
+            if _cooled((p["name"], key, None)):
+                continue
+            for model in list(p["models"]):
+                if (p["name"], model) in _dead_models or _cooled((p["name"], key, model)):
+                    continue
+                data = {
+                    "model": model,
+                    "messages": [{"role": "system", "content": system_prompt},
+                                 {"role": "user", "content": user_prompt}],
+                    "temperature": 0.6,
+                }
+                if p.get("max_tokens"):
+                    data["max_tokens"] = p["max_tokens"]
+                try:
+                    res = http.post(f"{p['base']}/chat/completions", headers=_auth(key), json=data, timeout=25)
+                except Exception as e:
+                    _set_cooldown((p["name"], key, model), 20)
+                    print(f"[AI] {p['name']} / {model}: ulanish xatosi ({type(e).__name__}), keyingisiga o'tildi.")
+                    continue
+                if res.status_code != 200:
+                    _handle_error(p, key, model, res)
+                    if _cooled((p["name"], key, None)):
+                        break  # bu kalit umuman ishlamaydi — keyingi kalitga
+                    continue
+                try:
+                    reply = _clean_reply(res.json()["choices"][0]["message"].get("content"))
+                except Exception:
+                    reply = ""
+                if not reply:
+                    continue
+                current = f"{p['name']} / {model}"
+                if ai_status["current"] != current:
+                    ai_status["current"] = current
+                    print(f"[AI] ✅ Hozir ishlatilayotgan AI: {current}")
+                ai_status["down"] = False
+                return reply
+
+    # Hech biri javob bermadi
+    with ai_lock:
+        ai_status["down"] = True
+        should_warn = time.time() - ai_status["last_warn"] > 300
+        if should_warn:
+            ai_status["last_warn"] = time.time()
+        waits = [t - time.time() for t in _cooldown.values() if t > time.time()]
+    if should_warn:
+        nxt = f" Eng yaqini ~{int(min(waits) // 60) + 1} daqiqadan keyin bo'shaydi." if waits else ""
+        print(f"[AI] ❌ Hech bir AI xizmati javob bermayapti (kalit yo'q, noto'g'ri yoki hammasi limitda).{nxt}\n"
+              "     main.py boshidagi GEMINI_API_KEY / CEREBRAS_API_KEY / ... qatorlariga yana kalit qo'shing.")
+    return None
+
+
+init_ai()
 
 
 # --- BAZA (javob berilgan xabar/izohlar) ---
@@ -222,67 +416,32 @@ def get_business_info(acc):
 
 
 # 2. AVTOMATIK JAVOBLAR (AI)
-def call_groq(system_prompt, user_prompt):
-    if not GROQ_API_KEY:
-        warn_bad_key("GROQ_API_KEY topilmadi")
-        return None
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-
-    with models_lock:
-        models = list(GROQ_MODELS)
-
-    for model_name in models:
-        data = {
-            "model": model_name,
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            "temperature": 0.6,
-            "max_tokens": 250,
-        }
-        try:
-            res = groq_session.post(url, headers=headers, json=data, timeout=15)
-            if res.status_code == 200:
-                ai_status["key_invalid"] = False
-                reply = (res.json()["choices"][0]["message"].get("content") or "").strip()
-                if "</think>" in reply:
-                    reply = reply.split("</think>")[-1].strip()
-                elif "<think>" in reply:
-                    continue  # fikrlash tugamay kesilgan — keyingi modelga
-                reply = reply.replace("**", "").strip().strip('"').strip()
-                if reply:
-                    return reply
-            elif res.status_code in (401, 403):
-                # Kalit noto'g'ri — boshqa modellarni sinash befoyda
-                warn_bad_key(f"Groq {res.status_code}: {res.text[:100]}")
-                return None
-            elif res.status_code in (400, 404):
-                with models_lock:
-                    if model_name in GROQ_MODELS and len(GROQ_MODELS) > 1:
-                        GROQ_MODELS.remove(model_name)
-            elif res.status_code == 429:
-                print(f"[AI] {model_name} limitga yetdi, keyingi model...")
-            else:
-                print(f"[AI] {model_name} xato {res.status_code}: {res.text[:150]}")
-        except Exception as e:
-            print(f"[AI] {model_name} so'rovida xato: {e}")
-    return None
-
-
 def get_dm_reply(business_info, behavior, user_text):
     system_prompt = (
         f"{behavior}\nSen ushbu biznesning shaxsiy menejerisan. Biznes ma'lumotlari:\n{business_info}\n"
         "Qisqa, lo'nda (1-2 gap) va 2 ta emoji bilan javob yoz."
     )
-    return call_groq(system_prompt, f"Mijoz DM da yozdi: '{user_text}'")
+    return call_ai(system_prompt, f"Mijoz DM da yozdi: '{user_text}'")
+
+
+# Faqat emoji/belgidan iborat izohlar (👏👏, ❤️🔥) — AI chaqirilmaydi, limit tejaladi
+EMOJI_COMMENT_REPLIES = ["Rahmat! 😊🙏", "Katta rahmat! ❤️😊", "Rahmat, kuzatib boring! 🔥😊", "Sizga ham rahmat! 🙌😊"]
+EMOJI_COMMENT_DM = False  # True qilsangiz, emoji yozganlarga ham DM yuboriladi
+
+
+def is_emoji_only(text):
+    return not re.search(r"\w", text or "")
 
 
 def get_comment_and_dm_reply(business_info, behavior, user_text):
+    if is_emoji_only(user_text):
+        dm = "Rahmat! 😊 Savollaringiz bo'lsa, shu yerga yozing 📩" if EMOJI_COMMENT_DM else None
+        return random.choice(EMOJI_COMMENT_REPLIES), dm
     system_prompt = (
         f"{behavior}\nBiznes ma'lumotlari:\n{business_info}\n"
         "Mijoz izohiga 2 ta qisqa javob tayyorla va ularni ||| bilan ajrat (1-izoh uchun, 2-DM uchun)."
     )
-    res = call_groq(system_prompt, f"Mijoz Reels ostiga izoh yozdi: '{user_text}'")
+    res = call_ai(system_prompt, f"Mijoz Reels ostiga izoh yozdi: '{user_text}'")
     if res and "|||" in res:
         parts = res.split("|||")
         comment_part, dm_part = parts[0].strip(), parts[1].strip()
@@ -626,9 +785,6 @@ def run_bot_for_account(acc):
             auto_comment = automation.get("auto_comment", True)
             replies_this_cycle = 0
 
-            if ai_status["key_invalid"]:
-                warn_bad_key()
-
             if not can_reply(0) and time.time() - hour_limit_warned > 600:
                 hour_limit_warned = time.time()
                 print(f"[{username}] ⏸ Soatlik limit ({MAX_REPLIES_PER_HOUR} ta javob) tugadi, biroz kutiladi.")
@@ -690,7 +846,7 @@ def run_bot_for_account(acc):
                     ai_reply = get_dm_reply(business_info, behavior, user_text)
                     if not ai_reply:
                         print(f"[{username}] ⚠️ AI javob bermadi, keyingi aylanishda qayta urinadi.")
-                        if ai_status["key_invalid"]:
+                        if not ai_available():
                             break  # kalit noto'g'ri — boshqa xabarlarni ham sinash befoyda
                         continue
 
@@ -726,7 +882,6 @@ def run_bot_for_account(acc):
 
             # --- B. REELS VA POST IZOHLARI ---
             if (auto_comment and can_reply(replies_this_cycle)
-                    and not ai_status["key_invalid"]
                     and time.time() >= next_comments_ts):
                 next_comments_ts = time.time() + COMMENTS_INTERVAL
                 if not medias_cache or time.time() - medias_cache_ts > MEDIA_REFRESH_SEC:
@@ -764,9 +919,9 @@ def run_bot_for_account(acc):
                         print(f"[{username}] 💬 Yangi izoh | {fmt_time(_c_time(comment))} da yozilgan | "
                               f"@{commenter_name}: {text}")
                         comment_reply, dm_reply = get_comment_and_dm_reply(business_info, behavior, text)
-                        if not (comment_reply and dm_reply):
+                        if not comment_reply:
                             print(f"[{username}] ⚠️ AI javob bermadi, keyingi aylanishda qayta urinadi.")
-                            if ai_status["key_invalid"]:
+                            if not ai_available():
                                 break
                             continue
 
@@ -782,7 +937,7 @@ def run_bot_for_account(acc):
                         except Exception as ce:
                             print(f"[{username}] ❌ Izoh yozishda xato: {ce}")
 
-                        if commenter_id:
+                        if commenter_id and dm_reply:
                             try:
                                 cl.direct_send(dm_reply, user_ids=[int(commenter_id)])
                                 print(f"[{username}] ✅ DM yuborildi: {dm_reply}")
